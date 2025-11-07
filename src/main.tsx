@@ -1,11 +1,10 @@
 import React from "react";
-import { createRoot } from "react-dom/client";
-import App from "./App";
+import ReactDOM from "react-dom/client";
+import ARFocusMVP from "./App";
+import "./index.css";
 
-// Mount the React app into the <div id="root"> in index.html
-const root = createRoot(document.getElementById("root")!);
-root.render(
+ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <App />
+    <ARFocusMVP />
   </React.StrictMode>
 );
