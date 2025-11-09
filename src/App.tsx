@@ -320,10 +320,11 @@ export default function App() {
   React.useEffect(() => { cfgRef.current = cfg; }, [cfg]);
   const motivation = useDailyMotivation();
   useSmartNotifications(profile?.premiumUnlocked ?? false);
-
+  const [cameraOn, setCameraOn] = useState(true);
   const [showPrivacy, setShowPrivacy] = useState(false);
   const [showCustomize, setShowCustomize] = useState(false);
   const [showLeaderboard, setShowLeaderboard] = useState(false);
+  const [camAR, setCamAR] = useState(4 / 3); // default 640x480
 
   // Timer
   const [workMinutes, setWorkMinutes] = useState(25);
@@ -413,22 +414,34 @@ export default function App() {
     };
   }, []);
 
-  // ---- Pause reset fix (only when idle in that phase)
+  // ---- Pause reset fix (only when IDLE, not when paused) --------------------
   useEffect(() => {
-    if (!isRunning && !isOnBreak) setSecondsLeft(workMinutes * 60);
+    // Idle + on WORK phase → keep MM:SS synced to workMinutes
+    if (!isRunning && !isOnBreak && sessionStartRef.current === null) {
+      setSecondsLeft(workMinutes * 60);
+    }
   }, [workMinutes, isRunning, isOnBreak]);
+
   useEffect(() => {
-    if (!isRunning && isOnBreak) setSecondsLeft(breakMinutes * 60);
+    // Idle + on BREAK phase → keep MM:SS synced to breakMinutes
+    if (!isRunning && isOnBreak && sessionStartRef.current === null) {
+      setSecondsLeft(breakMinutes * 60);
+    }
   }, [breakMinutes, isRunning, isOnBreak]);
-  // When difficulty changes and timer is idle, apply default mins
+
+  // When difficulty presets change, apply ONLY while truly idle (not paused)
   useEffect(() => {
+    // If a session has ever started, we're either running or paused → do nothing
+    if (sessionStartRef.current !== null) return;
+
     if (!isRunning && !isOnBreak) setWorkMinutes(cfg.defaultWork);
     if (!isRunning &&  isOnBreak) setBreakMinutes(cfg.defaultBreak);
-    // also reset phase timer if idle in that phase
+
     if (!isRunning) {
       setSecondsLeft((isOnBreak ? cfg.defaultBreak : cfg.defaultWork) * 60);
     }
   }, [cfg.defaultWork, cfg.defaultBreak, isRunning, isOnBreak]);
+
 
 
   // ---- Timer tick + HP + stat accumulation (uses classification)
@@ -591,63 +604,83 @@ export default function App() {
 
     async function boot() {
       try {
-        // camera
+        // 1) Ensure models are created once (reused across camera toggles)
+        const fs = await FilesetResolver.forVisionTasks(MP_WASM_URL);
+
+        if (!faceVideoRef.current || !faceImageRef.current) {
+          faceVideoRef.current = await FaceLandmarker.createFromOptions(fs, {
+            baseOptions: { modelAssetPath: MP_FACE_TASK, delegate: "GPU" },
+            runningMode: "VIDEO",
+            numFaces: 1,
+            outputFaceBlendshapes: false,
+            outputFacialTransformationMatrixes: true,
+          });
+          faceImageRef.current = await FaceLandmarker.createFromOptions(fs, {
+            baseOptions: { modelAssetPath: MP_FACE_TASK, delegate: "GPU" },
+            runningMode: "IMAGE",
+            numFaces: 1,
+            outputFaceBlendshapes: false,
+            outputFacialTransformationMatrixes: true,
+          });
+          setModelReady(true);
+        } else {
+          setModelReady(true);
+        }
+
+        if (!objVideoRef.current || !objImageRef.current) {
+          async function initObj(mode: "VIDEO" | "IMAGE") {
+            try {
+              return await ObjectDetector.createFromOptions(fs, {
+                baseOptions: { modelAssetPath: MP_OBJ_TASK, delegate: "GPU" },
+                runningMode: mode,
+                maxResults: 5,
+                scoreThreshold: 0.25,
+                categoryAllowlist: ["cell phone"],
+              });
+            } catch {
+              return await ObjectDetector.createFromOptions(fs, {
+                baseOptions: { modelAssetPath: MP_OBJ_TASK_FALLBACK, delegate: "GPU" },
+                runningMode: mode,
+                maxResults: 5,
+                scoreThreshold: 0.25,
+                categoryAllowlist: ["cell phone"],
+              });
+            }
+          }
+          objVideoRef.current = await initObj("VIDEO");
+          objImageRef.current = await initObj("IMAGE");
+          setObjectModelReady(true);
+        } else {
+          setObjectModelReady(true);
+        }
+
+        // 2) If camera is OFF, don't open it; just stop here.
+        if (!cameraOn) return;
+
+        // 3) Open camera stream
         stream = await navigator.mediaDevices.getUserMedia({
           video: { width: 640, height: 480, facingMode: "user" },
           audio: false,
         });
+
         const v = videoRef.current!;
         v.srcObject = stream;
         await v.play().catch(() => {});
+
+        // Set real aspect ratio so the box sizes correctly (no black bands)
+        const vw = v.videoWidth || 640;
+        const vh = v.videoHeight || 480;
+        if (vw && vh) setCamAR(vw / vh);
+
+        // ImageCapture for background frames
         const track = stream.getVideoTracks()[0];
         if (track && window.ImageCapture) {
-          try { imageCaptureRef.current = new window.ImageCapture(track); }
-          catch { imageCaptureRef.current = null; }
-        }
-
-        // models
-        const fs = await FilesetResolver.forVisionTasks(MP_WASM_URL);
-
-        // Face
-        faceVideoRef.current = await FaceLandmarker.createFromOptions(fs, {
-          baseOptions: { modelAssetPath: MP_FACE_TASK, delegate: "GPU" },
-          runningMode: "VIDEO",
-          numFaces: 1,
-          outputFaceBlendshapes: false,
-          outputFacialTransformationMatrixes: true,
-        });
-        faceImageRef.current = await FaceLandmarker.createFromOptions(fs, {
-          baseOptions: { modelAssetPath: MP_FACE_TASK, delegate: "GPU" },
-          runningMode: "IMAGE",
-          numFaces: 1,
-          outputFaceBlendshapes: false,
-          outputFacialTransformationMatrixes: true,
-        });
-        setModelReady(true);
-
-        // Object detector
-        async function initObj(mode: "VIDEO" | "IMAGE") {
           try {
-            return await ObjectDetector.createFromOptions(fs, {
-              baseOptions: { modelAssetPath: MP_OBJ_TASK, delegate: "GPU" },
-              runningMode: mode,
-              maxResults: 5,
-              scoreThreshold: 0.25,
-              categoryAllowlist: ["cell phone"],
-            });
+            imageCaptureRef.current = new window.ImageCapture(track);
           } catch {
-            return await ObjectDetector.createFromOptions(fs, {
-              baseOptions: { modelAssetPath: MP_OBJ_TASK_FALLBACK, delegate: "GPU" },
-              runningMode: mode,
-              maxResults: 5,
-              scoreThreshold: 0.25,
-              categoryAllowlist: ["cell phone"],
-            });
+            imageCaptureRef.current = null;
           }
         }
-        objVideoRef.current = await initObj("VIDEO");
-        objImageRef.current = await initObj("IMAGE");
-        setObjectModelReady(true);
 
         if (!cancelled) startLoops();
       } catch (e: any) {
@@ -656,17 +689,22 @@ export default function App() {
     }
 
     function startLoops() {
-      // Foreground rAF loop
+      // Foreground rAF loop (only when tab is visible)
       const tick = (ts: number) => {
         if (document.hidden) {
           rafRef.current = requestAnimationFrame(tick);
           return; // background handled by interval
         }
+
         const v = videoRef.current!;
         const c = canvasRef.current!;
         const ctx = c.getContext("2d")!;
-        if (c.width !== (v.videoWidth || 640)) c.width = v.videoWidth || 640;
-        if (c.height !== (v.videoHeight || 480)) c.height = v.videoHeight || 480;
+
+        // Keep canvas at exact video pixel size (overlay stays crisp)
+        const W = v.videoWidth || 640;
+        const H = v.videoHeight || 480;
+        if (c.width !== W) c.width = W;
+        if (c.height !== H) c.height = H;
 
         ctx.drawImage(v, 0, 0, c.width, c.height);
         stepVision({ mode: "video", t: ts, frame: v, ctx, w: c.width, h: c.height }).catch(() => {});
@@ -674,11 +712,12 @@ export default function App() {
       };
       rafRef.current = requestAnimationFrame(tick);
 
-      // Background interval loop
+      // Background interval loop (tab hidden)
       const bgStep = async () => {
         if (!document.hidden) return;
         const ic = imageCaptureRef.current;
         if (!ic) return;
+
         const c = canvasRef.current!;
         const ctx = c.getContext("2d")!;
         try {
@@ -689,22 +728,29 @@ export default function App() {
           await stepVision({ mode: "image", t: performance.now(), frame: bmp, ctx, w: c.width, h: c.height });
           (bmp as any).close?.();
         } catch {
-          // ignore
+          // ignore frame grab errors
         }
       };
       bgIntervalRef.current = window.setInterval(bgStep, BG_INTERVAL_MS) as unknown as number;
     }
 
+    // Boot (or re-boot) whenever the camera toggle changes
     boot();
 
+    // Cleanup on toggle or unmount
     return () => {
       cancelled = true;
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       if (bgIntervalRef.current) window.clearInterval(bgIntervalRef.current);
+
       const v = videoRef.current;
-      if (v && v.srcObject) (v.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+      if (v && v.srcObject) {
+        (v.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+        v.srcObject = null;
+      }
+      stream = null;
     };
-  }, []);
+  }, [cameraOn]);
 
   // ---- Vision step (VIDEO or IMAGE) -> updates signals and classification
   const emaRef = useRef(0);
@@ -972,6 +1018,20 @@ export default function App() {
   const Soft   = `${isDark ? "bg-slate-800/60" : "bg-slate-100"}`;
   const Subtle = `${isDark ? "text-slate-400" : "text-slate-500"}`;
   const Accent = `${isDark ? "text-indigo-300" : "text-indigo-600"}`;
+  // When camera turns off, blank the canvas to pure black
+  useEffect(() => {
+    if (cameraOn) return;
+    const c = canvasRef.current;
+    if (!c) return;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    // ensure the canvas has a size
+    if (!c.width) c.width = 640;
+    if (!c.height) c.height = 480;
+    ctx.clearRect(0, 0, c.width, c.height);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, c.width, c.height);
+  }, [cameraOn]);
 
   // ---- UI
   return (
@@ -1055,9 +1115,6 @@ export default function App() {
                 <div className={`text-xs mt-1 ${isOnBreak ? "text-amber-600" : "text-indigo-600"}`}>
                   {isOnBreak ? "Break" : "Focus"}
                 </div>
-                <div className={`absolute -bottom-2 left-1/2 -translate-x-1/2 text-xs font-semibold ${levelColor}`}>
-                  {level}
-                </div>
               </div>
             </div>
   
@@ -1119,10 +1176,11 @@ export default function App() {
                 </label>
                 <button
                   onClick={() => setBeepOnDistract((v) => !v)}
-                  className={`px-3 py-1 rounded-xl ${beepOnDistract ? "bg-emerald-600 text-white" : "bg-slate-200"}`}
-                >
+                  className={`px-3 py-1 rounded-xl ${
+                    beepOnDistract ? "bg-emerald-600 text-white" : "bg-slate-200 text-slate-900"}`}>
                   {beepOnDistract ? "On" : "Off"}
                 </button>
+
               </div>
               <div className="flex items-center justify-between">
                 <label className="text-sm">Beep volume</label>
@@ -1136,7 +1194,18 @@ export default function App() {
                   className="w-32"
                 />
               </div>
-  
+
+              <div className="flex items-center justify-between">
+                <label className="text-sm">Camera</label>
+                <button
+                  onClick={() => setCameraOn((v) => !v)}
+                  className={`px-3 py-1 rounded-xl ${
+                    cameraOn ? "bg-emerald-600 text-white" : "bg-slate-200 text-slate-900"}`}>
+                  {cameraOn ? "On" : "Off"}
+                </button>
+
+              </div>
+
               <div className={`text-xs ${Subtle} leading-relaxed`}>
                 • All processing is local in your browser. • No video is recorded or uploaded.
               </div>
@@ -1177,40 +1246,6 @@ export default function App() {
                   </span>
                 </div>
               </div>
-  
-              {/* Other tiles */}
-              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
-                <span className={Subtle}>Faces</span>
-                <span className="font-semibold">{facesCount}</span>
-              </div>
-              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
-                <span className={Subtle}>Tab active</span>
-                <span className="font-semibold">{!tabHidden ? "Yes" : "No"}</span>
-              </div>
-              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
-                <span className={Subtle}>Gaze on screen</span>
-                <span className="font-semibold">{gazeOn === null ? "—" : gazeOn ? "Yes" : "No"}</span>
-              </div>
-              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
-                <span className={Subtle}>Eyes visible</span>
-                <span className="font-semibold">{eyesVisible ? "Yes" : "No"}</span>
-              </div>
-              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
-                <span className={Subtle}>Head yaw (°)</span>
-                <span className="font-semibold">{Math.round(headYaw)}</span>
-              </div>
-              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
-                <span className={Subtle}>Head pitch (°)</span>
-                <span className="font-semibold">{Math.round(headPitch)}</span>
-              </div>
-              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
-                <span className={Subtle}>Looking down</span>
-                <span className="font-semibold">{lookingDown ? "Yes" : "No"}</span>
-              </div>
-              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
-                <span className={Subtle}>Camera covered</span>
-                <span className="font-semibold">{camCovered ? "Likely" : "No"}</span>
-              </div>
             </div>
             <div className={`mt-3 text-xs ${Subtle}`}>
               {modelReady ? "Face model active" : "Face model not loaded"} • {objectModelReady ? "Phone model active" : "Phone model not loaded"}
@@ -1221,47 +1256,65 @@ export default function App() {
   
         {/* Camera feed + chart */}
         <section className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className={`${isDark ? "bg-black/80" : "bg-black"} rounded-2xl overflow-hidden shadow relative`}>
-            <video ref={videoRef} playsInline className="w-full h-[260px] object-cover opacity-70" muted />
-            <canvas ref={canvasRef} className="absolute inset-0 w-full h-[260px]" />
+
+        {/* Camera box — correct aspect, no stretching, no black band */}
+        <div className={`${isDark ? "bg-black/80" : "bg-black"} rounded-2xl shadow`}>
+          {/* The inner wrapper defines the height using CSS aspect-ratio */}
+          <div className="relative w-full overflow-hidden rounded-2xl"
+              style={{ aspectRatio: camAR }}>
+            <video
+              ref={videoRef}
+              playsInline
+              muted
+              className={`w-full h-full object-cover opacity-70 ${cameraOn ? "" : "hidden"}`}
+            />
+
+            <canvas
+              ref={canvasRef}
+              // canvas tracks the same box; overlay exactly
+              className="absolute inset-0 w-full h-full pointer-events-none"
+            />
             {(!modelReady || !objectModelReady) && (
               <div className="absolute inset-0 flex items-center justify-center text-white/80 text-sm">
                 Initializing models…
               </div>
             )}
           </div>
-  
-          <div className={`${Pane}`}>
-            <h2 className={`font-semibold mb-3 flex items-center gap-2 ${Accent}`}>
-              <TrendingUp size={18} /> Weekly Focus vs Distraction
-            </h2>
-            <div className="w-full" style={{ height: 260, minWidth: 320 }} key={chartData.map(d => d.date).join("|")}>
-              {chartData.length > 0 ? (
-                <ResponsiveContainer width="100%" height="100%">
-                  <ComposedChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="date" tick={{ fontSize: 12 }} />
-                    <YAxis yAxisId="min" tick={{ fontSize: 12 }} label={{ value: "Minutes", angle: -90, position: "insideLeft" }} allowDecimals={false} />
-                    <YAxis yAxisId="rate" orientation="right" domain={[0, 1]} tickFormatter={(v) => `${Math.round(v * 100)}%`} />
-                    <Tooltip formatter={(value: any, name: any) => {
-                      if (name === "Focus rate") return [`${Math.round((value as number) * 100)}%`, name];
-                      return [Math.round(value as number), name];
-                    }} />
-                    <Legend />
-                    <Bar yAxisId="min" dataKey="distractMin" name="Distract (min)" stackId="a" fill="#ef4444" opacity={0.65} />
-                    <Bar yAxisId="min" dataKey="focusMin" name="Focus (min)" stackId="a" fill="#22c55e" opacity={0.75} />
-                    <Line yAxisId="rate" type="monotone" dataKey="focusRate" name="Focus rate" dot={false} stroke="#3b82f6" strokeWidth={2} />
-                  </ComposedChart>
-                </ResponsiveContainer>
-              ) : (
-                <div className={`h-full flex items-center justify-center text-sm ${Subtle}`}>
-                  No data yet — press <span className="mx-1 font-medium">Start</span>, then <span className="mx-1 font-medium">Save</span>.
-                </div>
-              )}
-            </div>
-            <p className={`mt-2 text-xs ${Subtle}`}>Bars: minutes per day (stacked). Line: % time focused.</p>
+        </div>
+
+        {/* Chart */}
+        <div className={`${Pane}`}>
+          <h2 className={`font-semibold mb-3 flex items-center gap-2 ${Accent}`}>
+            <TrendingUp size={18} /> Weekly Focus vs Distraction
+          </h2>
+          <div className="w-full" style={{ height: 260, minWidth: 320 }} key={chartData.map(d => d.date).join("|")}>
+            {chartData.length > 0 ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="date" tick={{ fontSize: 12 }} />
+                  <YAxis yAxisId="min" tick={{ fontSize: 12 }} label={{ value: "Minutes", angle: -90, position: "insideLeft" }} allowDecimals={false} />
+                  <YAxis yAxisId="rate" orientation="right" domain={[0, 1]} tickFormatter={(v) => `${Math.round(v * 100)}%`} />
+                  <Tooltip formatter={(value: any, name: any) => {
+                    if (name === "Focus rate") return [`${Math.round((value as number) * 100)}%`, name];
+                    return [Math.round(value as number), name];
+                  }} />
+                  <Legend />
+                  <Bar yAxisId="min" dataKey="distractMin" name="Distract (min)" stackId="a" fill="#ef4444" opacity={0.65} />
+                  <Bar yAxisId="min" dataKey="focusMin"   name="Focus (min)"   stackId="a" fill="#22c55e" opacity={0.75} />
+                  <Line yAxisId="rate" type="monotone" dataKey="focusRate" name="Focus rate" dot={false} stroke="#3b82f6" strokeWidth={2} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className={`h-full flex items-center justify-center text-sm ${Subtle}`}>
+                No data yet — press <span className="mx-1 font-medium">Start</span>, then <span className="mx-1 font-medium">Save</span>.
+              </div>
+            )}
           </div>
+          <p className={`mt-2 text-xs ${Subtle}`}>Bars: minutes per day (stacked). Line: % time focused.</p>
+        </div>
         </section>
+
   
         {/* History & Export */}
         <section className={`mt-6 ${Pane}`}>
