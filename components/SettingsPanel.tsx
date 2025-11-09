@@ -3,7 +3,7 @@ import { getSettings, subscribeSettings } from "../store/settings";
 
 export default function SettingsPanel() {
   const [s, setS] = useState(getSettings());
-  useEffect(() => subscribeSettings(() => setS(getSettings())), []);
+  useEffect(() => subscribeSettings(() => setS(getSettings())), []); // ✅ fine, since it returns a function
 
   return (
     <div className="p-4 space-y-3 text-sm">

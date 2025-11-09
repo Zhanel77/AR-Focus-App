@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from "react";
-import { fetchChallenges } from "@/lib/api";
+import { fetchActiveChallenges } from "../lib/api";
 
 export default function Challenges() {
   const [list, setList] = useState<any[]>([]);
-  useEffect(()=>{ fetchChallenges().then(setList); },[]);
+  useEffect(()=>{ fetchActiveChallenges().then(setList); },[]);
   return (
     <div className="p-4 space-y-3">
       <h2 className="text-lg font-semibold">Challenges</h2>

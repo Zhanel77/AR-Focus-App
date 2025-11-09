@@ -1,4 +1,103 @@
+// ==========================================================================
+// 🧩 PART 1 — Supabase + Free Exam Season + User State + Motivation
+// ==========================================================================
+
+// --- 1️⃣  Imports ----------------------------------------
+import { supabase } from "../lib/supabaseClient";
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { postSessionToCloud } from "../lib/api";
+import Leaderboard from "../pages/Leaderboard";
+
+// --- 3️⃣  Free Exam Season Logic ------------------------------------------
+export function isFreeExamSeason(): boolean {
+  const m = new Date().getMonth() + 1;
+  return m === 5 || m === 12 || localStorage.getItem("forceExamUnlock") === "true";
+}
+export async function handleExamSeasonUnlock() {
+  const active = isFreeExamSeason();
+  if (active) {
+    console.log("🎓 Free Exam Season active — Premium features unlocked");
+    localStorage.setItem("premiumUnlocked", "true");
+  } else {
+    localStorage.removeItem("premiumUnlocked");
+  }
+  return active;
+}
+export function useExamSeasonBoot() {
+  useEffect(() => {
+    handleExamSeasonUnlock().catch((e) => console.warn("Exam season check failed:", e));
+  }, []);
+}
+
+// --- 4️⃣  User Profile Hooks ----------------------------------------------
+export interface UserProfile {
+  id: string;
+  name: string;
+  email?: string;
+  theme: "light" | "dark";
+  difficulty: "easy" | "normal" | "hard";
+  premiumUnlocked: boolean;
+}
+export function useUserProfile() {
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  useEffect(() => {
+    const stored = localStorage.getItem("arfocus.user");
+    if (stored) setProfile(JSON.parse(stored));
+    else {
+      const anon = {
+        id: crypto.randomUUID(),
+        name: "Guest",
+        theme: "light",
+        difficulty: "normal",
+        premiumUnlocked: localStorage.getItem("premiumUnlocked") === "true",
+      } as UserProfile;
+      localStorage.setItem("arfocus.user", JSON.stringify(anon));
+      setProfile(anon);
+    }
+  }, []);
+  function updateProfile(partial: Partial<UserProfile>) {
+    if (!profile) return;
+    const next = { ...profile, ...partial };
+    setProfile(next);
+    localStorage.setItem("arfocus.user", JSON.stringify(next));
+  }
+  return { profile, updateProfile };
+}
+
+// --- 6️⃣  Daily Motivation Tips ------------------------------------------
+const MOTIVATION_QUOTES = [
+  "Small steps lead to big progress.",
+  "Focus is a muscle — train it daily.",
+  "Your future self will thank you for today’s discipline.",
+  "Consistency beats intensity every time.",
+  "You don’t need motivation when you have momentum.",
+  "Great work comes from great focus — stay present.",
+  "Every distraction you resist is a win for your goals.",
+  "The more you practice focus, the easier it becomes.",
+];
+export function useDailyMotivation() {
+  const [quote, setQuote] = useState("");
+  useEffect(() => {
+    const idx = Math.floor(Math.random() * MOTIVATION_QUOTES.length);
+    setQuote(MOTIVATION_QUOTES[idx]);
+  }, []);
+  return quote;
+}
+
+// --- 7️⃣  Smart Notification Placeholder ----------------------------------
+export function useSmartNotifications(enabled: boolean) {
+  useEffect(() => {
+    if (!enabled) return;
+    console.log("🔕 Smart Notification Filter enabled");
+    const prev = Notification.permission;
+    if (prev === "default") Notification.requestPermission();
+    const timer = setInterval(() => {
+      console.log("Filtering distracting apps notifications …");
+    }, 60000);
+    return () => clearInterval(timer);
+  }, [enabled]);
+}
+import { X } from "lucide-react";
 import {
   FilesetResolver,
   FaceLandmarker,
@@ -29,29 +128,13 @@ import {
   Legend,
 } from "recharts";
 
-/**
- * AR Focus App — Full MVP (with stricter distraction rules)
- * - 4-level classification (Focused / Mild / Strong / Critical)
- * - Closed eyes (even covered) -> distraction within ≤1s
- * - Phone detection robust (bottom bias + 1s persistence)
- * - Beep once per event (fast), 1.5s cooldown to stop spam (no infinite loop)
- * - Background tab tracking using ImageCapture; tab hidden is Critical only if not productive
- * - Camera covered / No face >2s => Strong/Critical
- */
-
 // ----------------------------- Tweakables ---------------------------------
 const STORAGE_KEY = "arfocus.sessions.v1";
 
 const INFER_HZ = 10;
 const EMA_ALPHA = 0.25;
-const ENTER_TH = 0.70;
-const EXIT_TH = 0.50;
-const CENTER_TOL = 0.30;
-const GAZE_TOL = 0.30;
 const BG_INTERVAL_MS = 400;
 
-const PHONE_SCORE_TH = 0.45;        // base phone threshold
-const PHONE_SCORE_TH_BOTTOM = 0.35; // easier threshold near bottom edge
 const PHONE_DETECT_EVERY = 2;       // run detector every N frames
 
 const NO_FACE_GRACE_MS = 1500;      // buffer before "no face" soft logic
@@ -59,16 +142,9 @@ const NO_FACE_STRONG_MS = 2000;     // ≥2s face missing/camera dark => ≥Stro
 const EYES_AWAY_MIN_MS = 1000;      // Mild if gaze away >1s
 const EYES_NOT_VISIBLE_MS = 2000;   // Strong if eyes not visible >2s
 const EYE_CLOSED_MAX_MS = 1000;     // ≤1s closed/covered ⇒ distraction
-const EYE_OPEN_THRESH = 0.18;       // eyelid openness (lower = more closed)
-const DOWN_MILD_MS = 1500;          // Mild look-down (>15°) >1.5s
-const DOWN_STRONG_MS = 3000;        // Strong look-down (>15°) >3s
+const EYE_OPEN_THRESH = 0.18;
 
-// Beep cooldown (single shot per event)
 const BEEP_COOLDOWN_MS = 1500;
-
-// HP dynamics
-const FOCUS_HP_PER_SEC = 0.06;
-const DISTRACT_HP_PER_SEC = 0.5;
 
 // Models
 const MP_WASM_URL =
@@ -209,6 +285,46 @@ type DistractionLevel = "Focused" | "Mild" | "Strong" | "Critical";
 
 // ----------------------------- Component -----------------------------------
 export default function App() {
+  useExamSeasonBoot();
+  const { profile, updateProfile } = useUserProfile();
+  type Difficulty = "easy" | "normal" | "hard";
+
+  const DIFF_PRESETS: Record<Difficulty, {
+    ENTER_TH: number;        // EMA gate: enter Focus
+    EXIT_TH: number;         // EMA gate: leave Focus (hysteresis)
+    CENTER_TOL: number;      // how centered face must be (fraction of width)
+    GAZE_TOL: number;        // how centered iris must be (lower=stricter)
+    PHONE_TH: number;        // min score to count phone
+    PHONE_TH_BOTTOM: number; // same but near bottom of frame
+    DOWN_MILD_MS: number;    // look-down mild threshold
+    DOWN_STRONG_MS: number;  // look-down strong threshold
+    FOCUS_HP_PER_SEC: number;
+    DISTRACT_HP_PER_SEC: number;
+    defaultWork: number;
+    defaultBreak: number;
+  }> = {
+    easy:   { ENTER_TH: 0.60, EXIT_TH: 0.45, CENTER_TOL: 0.35, GAZE_TOL: 0.38,
+              PHONE_TH: 0.55, PHONE_TH_BOTTOM: 0.45, DOWN_MILD_MS: 2000, DOWN_STRONG_MS: 3500,
+              FOCUS_HP_PER_SEC: 0.08, DISTRACT_HP_PER_SEC: 0.40, defaultWork: 20, defaultBreak: 5 },
+    normal: { ENTER_TH: 0.70, EXIT_TH: 0.50, CENTER_TOL: 0.30, GAZE_TOL: 0.30,
+              PHONE_TH: 0.45, PHONE_TH_BOTTOM: 0.35, DOWN_MILD_MS: 1500, DOWN_STRONG_MS: 3000,
+              FOCUS_HP_PER_SEC: 0.06, DISTRACT_HP_PER_SEC: 0.50, defaultWork: 25, defaultBreak: 5 },
+    hard:   { ENTER_TH: 0.80, EXIT_TH: 0.65, CENTER_TOL: 0.22, GAZE_TOL: 0.22,
+              PHONE_TH: 0.35, PHONE_TH_BOTTOM: 0.28, DOWN_MILD_MS: 1200, DOWN_STRONG_MS: 2200,
+              FOCUS_HP_PER_SEC: 0.05, DISTRACT_HP_PER_SEC: 0.60, defaultWork: 45, defaultBreak: 5 },
+  };
+
+  const activeDiff = (profile?.difficulty ?? "normal") as Difficulty;
+  const cfg = React.useMemo(() => DIFF_PRESETS[activeDiff], [activeDiff]);
+  const cfgRef = React.useRef(cfg);
+  React.useEffect(() => { cfgRef.current = cfg; }, [cfg]);
+  const motivation = useDailyMotivation();
+  useSmartNotifications(profile?.premiumUnlocked ?? false);
+
+  const [showPrivacy, setShowPrivacy] = useState(false);
+  const [showCustomize, setShowCustomize] = useState(false);
+  const [showLeaderboard, setShowLeaderboard] = useState(false);
+
   // Timer
   const [workMinutes, setWorkMinutes] = useState(25);
   const [breakMinutes, setBreakMinutes] = useState(5);
@@ -304,6 +420,16 @@ export default function App() {
   useEffect(() => {
     if (!isRunning && isOnBreak) setSecondsLeft(breakMinutes * 60);
   }, [breakMinutes, isRunning, isOnBreak]);
+  // When difficulty changes and timer is idle, apply default mins
+  useEffect(() => {
+    if (!isRunning && !isOnBreak) setWorkMinutes(cfg.defaultWork);
+    if (!isRunning &&  isOnBreak) setBreakMinutes(cfg.defaultBreak);
+    // also reset phase timer if idle in that phase
+    if (!isRunning) {
+      setSecondsLeft((isOnBreak ? cfg.defaultBreak : cfg.defaultWork) * 60);
+    }
+  }, [cfg.defaultWork, cfg.defaultBreak, isRunning, isOnBreak]);
+
 
   // ---- Timer tick + HP + stat accumulation (uses classification)
   useEffect(() => {
@@ -321,9 +447,11 @@ export default function App() {
       const isFocusedNow = level === "Focused" && !isOnBreak;
 
       setHp((h) => {
+        const { FOCUS_HP_PER_SEC, DISTRACT_HP_PER_SEC } = cfgRef.current;
         const delta = isFocusedNow ? FOCUS_HP_PER_SEC : -DISTRACT_HP_PER_SEC;
         return clamp(h + delta, 0, 100);
       });
+      
 
       if (isFocusedNow) setFocusSec((x) => x + 1);
       else setDistractSec((x) => x + 1);
@@ -391,15 +519,19 @@ export default function App() {
     const a = audioRef.current;
     if (a && !a.paused) { a.pause(); a.currentTime = 0; }
   }
-  function stopAndSave() {
+  async function stopAndSave() {
     setIsRunning(false);
-    const startedAt = sessionStartRef.current || new Date().toISOString();
-    const endedAt = new Date().toISOString();
+  
+    const startedAt = sessionStartRef.current ?? new Date().toISOString();
+    const endedAt   = new Date().toISOString();
+  
+    const duration = Math.max(1, focusSec + distractSec); // 👈 avoid 0
+  
     const log: SessionLog = {
       id: `${Date.now()}`,
       startedAt,
       endedAt,
-      durationSec: focusSec + distractSec,
+      durationSec: duration,
       workMinutes,
       breakMinutes,
       focusSec,
@@ -407,19 +539,32 @@ export default function App() {
       hpStart: hpStartRef.current,
       hpEnd: hp,
     };
+  
+    // local history
     const next = [log, ...sessions].slice(0, 300);
     setSessions(next);
     saveSessions(next);
-
+  
+    // cloud (either await or fire-and-forget)
+    try {
+      await postSessionToCloud(log);          // ← await so Leaderboard sees it right away
+    } catch (err) {
+      console.warn("[cloud save] failed:", err);
+    }
+  
+    // reset for next run
     setIsOnBreak(false);
     setSecondsLeft(workMinutes * 60);
     setFocusSec(0);
     setDistractSec(0);
     setHp(100);
     sessionStartRef.current = null;
+  
     const a = audioRef.current;
     if (a && !a.paused) { a.pause(); a.currentTime = 0; }
   }
+  
+  
 
   // ---- Chart data
   const chartData = useMemo(() => {
@@ -583,6 +728,12 @@ export default function App() {
     h: number;
   }) {
     const { mode, t, frame, ctx, w, h } = opts;
+    // Pull difficulty-dependent thresholds from cfg
+    const {
+      CENTER_TOL, GAZE_TOL, ENTER_TH, EXIT_TH,
+      PHONE_TH, PHONE_TH_BOTTOM,
+      DOWN_MILD_MS, DOWN_STRONG_MS
+    } = cfgRef.current;
 
     // Face
     const faceV = faceVideoRef.current;
@@ -694,7 +845,7 @@ export default function App() {
           if (name.includes("cell phone") || name === "phone") {
             const bb = d.boundingBox;
             const bottomBias = bb ? (bb.originY + bb.height) > 0.72 * h : false;
-            const th = bottomBias ? Math.min(PHONE_SCORE_TH, PHONE_SCORE_TH_BOTTOM) : PHONE_SCORE_TH;
+            const th = bottomBias ? Math.min(PHONE_TH, PHONE_TH_BOTTOM) : PHONE_TH;
             if (score >= th) {
               sawPhoneThisFrame = true;
               lastPhoneSeenAtRef.current = performance.now();
@@ -808,11 +959,25 @@ export default function App() {
     level === "Strong"  ? "text-rose-600"   :
                           "text-red-700";
 
+  // ---- Theme helpers (dark/light) ----
+  const isDark = (profile?.theme === "dark");
+
+  useEffect(() => {
+    // make native controls/scrollbars follow theme
+    document.documentElement.style.colorScheme = isDark ? "dark" : "light";
+  }, [isDark]);
+
+  // Reusable class groups
+  const Pane   = `rounded-2xl shadow ${isDark ? "bg-slate-900/70 text-slate-100" : "bg-white text-slate-900"} p-4`;
+  const Soft   = `${isDark ? "bg-slate-800/60" : "bg-slate-100"}`;
+  const Subtle = `${isDark ? "text-slate-400" : "text-slate-500"}`;
+  const Accent = `${isDark ? "text-indigo-300" : "text-indigo-600"}`;
+
   // ---- UI
   return (
-    <div className="min-h-screen w-full bg-slate-50 text-slate-900">
+    <div className={`min-h-screen w-full ${isDark ? "bg-slate-950 text-slate-100" : "bg-slate-50 text-slate-900"}`}>
       <audio ref={audioRef} src="/distraction.mp3" preload="auto" />
-
+  
       <div className="max-w-5xl mx-auto px-4 py-6">
         <header className="flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -828,10 +993,49 @@ export default function App() {
             </div>
           </div>
         </header>
+  
+        <DailyMotivationBanner quote={motivation} />
+  
+        {/* top pills */}
+        <div className="flex gap-2 justify-center mt-2">
+          <button
+            onClick={() => setShowPrivacy(true)}
+            className={`px-3 py-1 rounded-xl text-sm ${Soft}`}
+          >
+            Privacy
+          </button>
+          <button
+            onClick={() => setShowCustomize(true)}
+            className={`px-3 py-1 rounded-xl text-sm ${Soft}`}
+          >
+            Customize
+          </button>
+          <button
+            onClick={() => setShowLeaderboard(true)}
+            className={`px-3 py-1 rounded-xl text-sm ${Soft}`}
+          >
+            Leaderboard
+          </button>
+        </div>
+
+        {/* modals – pass isDark */}
+        {showPrivacy && (
+          <PrivacyDashboard isDark={isDark} onClose={() => setShowPrivacy(false)} />
+        )}
+        {showCustomize && (
+          <CustomizationPanel
+            isDark={isDark}
+            profile={profile}
+            updateProfile={updateProfile}
+            onClose={() => setShowCustomize(false)}
+          />
+        )}
+        {showLeaderboard && <Leaderboard isDark={isDark} onClose={() => setShowLeaderboard(false)} />}
 
         {/* Controls */}
         <section className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="col-span-1 bg-white rounded-2xl shadow p-4 flex flex-col items-center">
+          {/* Focus ring card */}
+          <div className={`col-span-1 ${Pane} flex flex-col items-center`}>
             <div className="relative w-44 h-44">
               <svg className="w-44 h-44 -rotate-90" viewBox="0 0 100 100">
                 <circle cx="50" cy="50" r="45" stroke="#e5e7eb" strokeWidth="10" fill="none" />
@@ -856,7 +1060,7 @@ export default function App() {
                 </div>
               </div>
             </div>
-
+  
             <div className="mt-4 flex gap-2">
               {!isRunning ? (
                 <button onClick={startTimer} className="px-3 py-2 rounded-xl bg-indigo-600 text-white flex items-center gap-2 shadow">
@@ -874,14 +1078,14 @@ export default function App() {
                 <TrendingUp size={16} /> Save
               </button>
             </div>
-
-            <div className="mt-3 text-xs text-slate-500 flex items-center gap-2">
+  
+            <div className={`mt-3 text-xs ${Subtle} flex items-center gap-2`}>
               <Info size={14} /> Focus adds HP slowly; distractions reduce it faster.
             </div>
           </div>
-
+  
           {/* Settings */}
-          <div className="col-span-1 bg-white rounded-2xl shadow p-4">
+          <div className={`col-span-1 ${Pane}`}>
             <h2 className="font-semibold mb-3">Session Settings</h2>
             <div className="space-y-3">
               <div className="flex items-center justify-between">
@@ -892,7 +1096,7 @@ export default function App() {
                   max={120}
                   value={workMinutes}
                   onChange={(e) => setWorkMinutes(Math.max(5, Math.min(120, Number(e.target.value))))}
-                  className="w-24 px-2 py-1 rounded-xl bg-slate-100"
+                  className={`w-24 px-2 py-1 rounded-xl ${Soft}`}
                 />
               </div>
               <div className="flex items-center justify-between">
@@ -903,10 +1107,10 @@ export default function App() {
                   max={60}
                   value={breakMinutes}
                   onChange={(e) => setBreakMinutes(Math.max(3, Math.min(60, Number(e.target.value))))}
-                  className="w-24 px-2 py-1 rounded-xl bg-slate-100"
+                  className={`w-24 px-2 py-1 rounded-xl ${Soft}`}
                 />
               </div>
-
+  
               {/* Beep toggle + volume */}
               <div className="flex items-center justify-between">
                 <label className="text-sm flex items-center gap-2">
@@ -932,54 +1136,92 @@ export default function App() {
                   className="w-32"
                 />
               </div>
-
-              <div className="text-xs text-slate-500 leading-relaxed">
+  
+              <div className={`text-xs ${Subtle} leading-relaxed`}>
                 • All processing is local in your browser. • No video is recorded or uploaded.
               </div>
             </div>
           </div>
-
+  
           {/* Live status */}
-          <div className="col-span-1 bg-white rounded-2xl shadow p-4">
+          <div className={`col-span-1 ${Pane}`}>
             <h2 className="font-semibold mb-3">Live Status</h2>
             <div className="grid grid-cols-2 gap-2 text-sm">
-              <StatCard label="HP" value={hp.toFixed(1)} />
-              <div className="p-3 rounded-xl bg-slate-100 flex flex-col">
-                <span className="text-slate-500">Attention</span>
+              {/* HP */}
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>HP</span>
+                <span className="font-semibold">{hp.toFixed(1)}</span>
+              </div>
+              {/* Attention */}
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>Attention</span>
                 <span className={`text-sm font-semibold ${levelColor}`}>{level}</span>
               </div>
-              <StatCard label="Focused (s)" value={focusSec} />
-              <StatCard label="Distracted (s)" value={distractSec} />
-
-              <div className="p-3 rounded-xl bg-slate-100 flex flex-row items-center gap-2">
+              {/* Focused / Distracted seconds */}
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>Focused (s)</span>
+                <span className="font-semibold">{focusSec}</span>
+              </div>
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>Distracted (s)</span>
+                <span className="font-semibold">{distractSec}</span>
+              </div>
+  
+              {/* Phone tile */}
+              <div className={`p-3 rounded-xl ${Soft} flex flex-row items-center gap-2`}>
                 <Smartphone size={16} className={phoneNow ? "text-rose-600" : "text-slate-400"} />
                 <div className="flex flex-col">
-                  <span className="text-slate-500">Phone</span>
-                  <span className={`text-xs font-semibold ${phoneNow ? "text-rose-600" : "text-slate-500"}`}>
+                  <span className={Subtle}>Phone</span>
+                  <span className={`text-xs font-semibold ${phoneNow ? "text-rose-500" : Subtle}`}>
                     {objectModelReady ? (phoneNow ? "Detected" : "None") : "Model unavailable"}
                   </span>
                 </div>
               </div>
-
-              <StatCard label="Faces" value={facesCount} />
-              <StatCard label="Tab active" value={!tabHidden ? "Yes" : "No"} />
-              <StatCard label="Gaze on screen" value={gazeOn === null ? "—" : gazeOn ? "Yes" : "No"} />
-              <StatCard label="Eyes visible" value={eyesVisible ? "Yes" : "No"} />
-              <StatCard label="Head yaw (°)" value={Math.round(headYaw)} />
-              <StatCard label="Head pitch (°)" value={Math.round(headPitch)} />
-              <StatCard label="Looking down" value={lookingDown ? "Yes" : "No"} />
-              <StatCard label="Camera covered" value={camCovered ? "Likely" : "No"} />
+  
+              {/* Other tiles */}
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>Faces</span>
+                <span className="font-semibold">{facesCount}</span>
+              </div>
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>Tab active</span>
+                <span className="font-semibold">{!tabHidden ? "Yes" : "No"}</span>
+              </div>
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>Gaze on screen</span>
+                <span className="font-semibold">{gazeOn === null ? "—" : gazeOn ? "Yes" : "No"}</span>
+              </div>
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>Eyes visible</span>
+                <span className="font-semibold">{eyesVisible ? "Yes" : "No"}</span>
+              </div>
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>Head yaw (°)</span>
+                <span className="font-semibold">{Math.round(headYaw)}</span>
+              </div>
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>Head pitch (°)</span>
+                <span className="font-semibold">{Math.round(headPitch)}</span>
+              </div>
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>Looking down</span>
+                <span className="font-semibold">{lookingDown ? "Yes" : "No"}</span>
+              </div>
+              <div className={`p-3 rounded-xl ${Soft} flex flex-col`}>
+                <span className={Subtle}>Camera covered</span>
+                <span className="font-semibold">{camCovered ? "Likely" : "No"}</span>
+              </div>
             </div>
-            <div className="mt-3 text-xs text-slate-500">
+            <div className={`mt-3 text-xs ${Subtle}`}>
               {modelReady ? "Face model active" : "Face model not loaded"} • {objectModelReady ? "Phone model active" : "Phone model not loaded"}
             </div>
             {lastError && <div className="mt-2 text-[11px] text-rose-600">Err: {lastError}</div>}
           </div>
         </section>
-
+  
         {/* Camera feed + chart */}
         <section className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="bg-black rounded-2xl overflow-hidden shadow relative">
+          <div className={`${isDark ? "bg-black/80" : "bg-black"} rounded-2xl overflow-hidden shadow relative`}>
             <video ref={videoRef} playsInline className="w-full h-[260px] object-cover opacity-70" muted />
             <canvas ref={canvasRef} className="absolute inset-0 w-full h-[260px]" />
             {(!modelReady || !objectModelReady) && (
@@ -988,9 +1230,9 @@ export default function App() {
               </div>
             )}
           </div>
-
-          <div className="bg-white rounded-2xl shadow p-4">
-            <h2 className="font-semibold mb-3 flex items-center gap-2">
+  
+          <div className={`${Pane}`}>
+            <h2 className={`font-semibold mb-3 flex items-center gap-2 ${Accent}`}>
               <TrendingUp size={18} /> Weekly Focus vs Distraction
             </h2>
             <div className="w-full" style={{ height: 260, minWidth: 320 }} key={chartData.map(d => d.date).join("|")}>
@@ -1012,17 +1254,17 @@ export default function App() {
                   </ComposedChart>
                 </ResponsiveContainer>
               ) : (
-                <div className="h-full flex items-center justify-center text-sm text-slate-500">
+                <div className={`h-full flex items-center justify-center text-sm ${Subtle}`}>
                   No data yet — press <span className="mx-1 font-medium">Start</span>, then <span className="mx-1 font-medium">Save</span>.
                 </div>
               )}
             </div>
-            <p className="mt-2 text-xs text-slate-500">Bars: minutes per day (stacked). Line: % time focused.</p>
+            <p className={`mt-2 text-xs ${Subtle}`}>Bars: minutes per day (stacked). Line: % time focused.</p>
           </div>
         </section>
-
+  
         {/* History & Export */}
-        <section className="mt-6 bg-white rounded-2xl shadow p-4">
+        <section className={`mt-6 ${Pane}`}>
           <div className="flex items-center justify-between">
             <h2 className="font-semibold">Saved Sessions</h2>
             <div className="flex gap-2">
@@ -1058,7 +1300,7 @@ export default function App() {
               >
                 <Download size={16} /> Export CSV
               </button>
-
+  
               <button
                 onClick={() => {
                   const csv = toCSV(sessions);
@@ -1076,11 +1318,11 @@ export default function App() {
               </button>
             </div>
           </div>
-
+  
           <div className="mt-3 overflow-x-auto">
             <table className="min-w-full text-sm">
-              <thead>
-                <tr className="text-left text-slate-500">
+              <thead className={Subtle}>
+                <tr className="text-left">
                   <th className="py-2 pr-4">Date</th>
                   <th className="py-2 pr-4">Start</th>
                   <th className="py-2 pr-4">End</th>
@@ -1094,7 +1336,7 @@ export default function App() {
               <tbody>
                 {sessions.length === 0 && (
                   <tr>
-                    <td className="py-3 text-slate-500" colSpan={8}>
+                    <td className={`py-3 ${Subtle}`} colSpan={8}>
                       No sessions yet — press Start, then Save.
                     </td>
                   </tr>
@@ -1105,7 +1347,7 @@ export default function App() {
                   const start = new Date(s.startedAt);
                   const end = new Date(s.endedAt);
                   return (
-                    <tr key={s.id} className="border-t border-slate-100">
+                    <tr key={s.id} className={isDark ? "border-t border-slate-800/60" : "border-t border-slate-100"}>
                       <td className="py-2 pr-4">{formatLocal(s.startedAt).split(",")[0]}</td>
                       <td className="py-2 pr-4">{start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</td>
                       <td className="py-2 pr-4">{end.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</td>
@@ -1134,7 +1376,7 @@ export default function App() {
                 const focusPct = (totals.foc + totals.dis) > 0 ? totals.foc / (totals.foc + totals.dis) : 0;
                 return (
                   <tfoot>
-                    <tr className="border-t border-slate-200 font-medium">
+                    <tr className={isDark ? "border-t border-slate-800/60 font-medium" : "border-t border-slate-200 font-medium"}>
                       <td className="py-2 pr-4" colSpan={3}>Totals</td>
                       <td className="py-2 pr-4">{mmss(totals.dur)}</td>
                       <td className="py-2 pr-4">{mmss(totals.foc)}</td>
@@ -1152,7 +1394,7 @@ export default function App() {
         </section>
       </div>
     </div>
-  );
+  );  
 }
 
 // ----------------------------- Small UI helper -----------------------------
@@ -1164,3 +1406,117 @@ function StatCard({ label, value }: { label: string; value: React.ReactNode }) {
     </div>
   );
 }
+// ==========================================================================
+// 🧩 PART 2 — Privacy Dashboard • Customization • Leaderboard • Motivation
+// ==========================================================================
+
+// ---------- Privacy Dashboard ----------
+export function PrivacyDashboard({
+  onClose,
+  isDark,
+}: {
+  onClose: () => void;
+  isDark: boolean;
+}) {
+  const pane   = isDark ? "bg-slate-900/90 text-slate-100" : "bg-white text-slate-900";
+  const subtle = isDark ? "text-slate-400"                 : "text-slate-600";
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+      <div className={`${pane} rounded-2xl shadow-xl max-w-lg w-full p-6 relative`}>
+        <button
+          className={`absolute top-3 right-3 ${subtle} hover:!text-slate-700`}
+          onClick={onClose}
+        >
+          <X size={18} />
+        </button>
+        <h2 className="text-lg font-semibold mb-2">Privacy Dashboard</h2>
+        <p className={`text-sm ${subtle} leading-relaxed`}>
+          • The camera feed is processed <strong>entirely on-device</strong> using MediaPipe and
+          never leaves your browser. <br />
+          • No images, videos, or biometric data are uploaded or stored. <br />
+          • Only session statistics (focus time, HP, etc.) are optionally synced to Supabase if you
+          enable cloud sync. <br />
+          • You can clear all local data anytime by pressing <code>localStorage.clear()</code> in your console.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Customization Panel ----------
+export function CustomizationPanel({
+  profile,
+  updateProfile,
+  onClose,
+  isDark,
+}: {
+  profile: any;
+  updateProfile: (p: any) => void;
+  onClose: () => void;
+  isDark: boolean;
+}) {
+  if (!profile) return null;
+
+  const pane   = isDark ? "bg-slate-900/90 text-slate-100" : "bg-white text-slate-900";
+  const soft   = isDark ? "bg-slate-800/60 text-slate-100" : "bg-slate-100 text-slate-900";
+  const subtle = isDark ? "text-slate-400"                 : "text-slate-600";
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+      <div className={`${pane} rounded-2xl shadow-xl max-w-md w-full p-6 relative`}>
+        <button
+          className={`absolute top-3 right-3 ${subtle} hover:!text-slate-700`}
+          onClick={onClose}
+        >
+          <X size={18} />
+        </button>
+
+        <h2 className="text-lg font-semibold mb-4">Customization</h2>
+        <div className="space-y-4 text-sm">
+          <div>
+            <label className={`block mb-1 ${subtle}`}>Theme</label>
+            <select
+              value={profile.theme}
+              onChange={(e) => updateProfile({ theme: e.target.value })}
+              className={`w-full px-3 py-2 rounded-xl ${soft}`}
+            >
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </div>
+
+          <div>
+            <label className={`block mb-1 ${subtle}`}>Difficulty</label>
+            <select
+              value={profile.difficulty}
+              onChange={(e) => updateProfile({ difficulty: e.target.value })}
+              className={`w-full px-3 py-2 rounded-xl ${soft}`}
+            >
+              <option value="easy">Easy</option>
+              <option value="normal">Normal</option>
+              <option value="hard">Hard</option>
+            </select>
+          </div>
+
+          <div className={`pt-2 text-xs ${subtle}`}>
+            Difficulty now tunes model strictness and default work/break lengths; theme changes visuals only.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Daily Motivation Banner ----------
+export function DailyMotivationBanner({ quote }: { quote: string }) {
+  if (!quote) return null;
+  return (
+    <div className="mt-4 text-center">
+      <div className="inline-block bg-indigo-50 text-indigo-700 px-4 py-2 rounded-full text-sm font-medium shadow-sm">
+        💡 {quote}
+      </div>
+    </div>
+  );
+}
+

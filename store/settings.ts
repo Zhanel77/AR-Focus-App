@@ -34,4 +34,8 @@ export function useSettings(): [Settings, (patch: Partial<Settings>) => void] {
   return [state, set] as any;
 }
 export function getSettings() { return state; }
-export function subscribeSettings(fn: () => void) { listeners.add(fn); return () => listeners.delete(fn); }
+export function subscribeSettings(fn: () => void): () => void {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
