@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AR Focus Companion</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      font-family: system-ui, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+    }
+    button {
+      border: none;
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 13px;
+      cursor: pointer;
+      background: #1e293b;
+      color: #e2e8f0;
+      transition: 0.2s;
+    }
+    button:hover { background: #334155; }
+    button:active { background: #475569; }
+    #status {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div id="status">Focused</div>
+  <div id="timer">00:00</div>
+  <div>
+    <button id="start">Start</button>
+    <button id="pause">Pause</button>
+    <button id="reset">Reset</button>
+    <button id="save">Save</button>
+  </div>
+
+  <script>
+    const ch = new BroadcastChannel('arfocus-productive');
+
+    // send heartbeat every second
+    setInterval(() => ch.postMessage({ type: 'productive:ping', ts: Date.now() }), 1000);
+
+    // listen for main app updates
+    ch.onmessage = (ev) => {
+      const msg = ev.data || {};
+      if (msg.type === 'focus:update') {
+        document.getElementById('status').textContent =
+          msg.focused ? 'Focused' : 'Distracted';
+        document.getElementById('timer').textContent = msg.timer || '00:00';
+      }
+    };
+
+    // relay control actions to main app
+    document.getElementById('start').onclick = () => ch.postMessage({ type: 'control:start' });
+    document.getElementById('pause').onclick = () => ch.postMessage({ type: 'control:pause' });
+    document.getElementById('reset').onclick = () => ch.postMessage({ type: 'control:reset' });
+    document.getElementById('save').onclick = () => ch.postMessage({ type: 'control:save' });
+  </script>
+</body>
+</html>

@@ -144,7 +144,10 @@ const EYES_NOT_VISIBLE_MS = 2000;   // Strong if eyes not visible >2s
 const EYE_CLOSED_MAX_MS = 1000;     // ≤1s closed/covered ⇒ distraction
 const EYE_OPEN_THRESH = 0.18;
 
-const BEEP_COOLDOWN_MS = 1500;
+// ---- Beep settings (continuous tone) ----
+const BEEP_START_DELAY_MS = 600;   // wait this long after distraction before tone
+const BEEP_FREQ_HZ = 880;          // pitch of the tone (Hz)
+const BEEP_MAX_GAIN = 0.25;        // safety cap; final volume = slider * this
 
 // Models
 const MP_WASM_URL =
@@ -325,6 +328,7 @@ export default function App() {
   const [showCustomize, setShowCustomize] = useState(false);
   const [showLeaderboard, setShowLeaderboard] = useState(false);
   const [camAR, setCamAR] = useState(4 / 3); // default 640x480
+  const [mirrorCam, setMirrorCam] = useState(true);
 
   // Timer
   const [workMinutes, setWorkMinutes] = useState(25);
@@ -346,6 +350,12 @@ export default function App() {
   const [beepOnDistract, setBeepOnDistract] = useState(true);
   const [beepVolume, setBeepVolume] = useState(0.6);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  // Web Audio for continuous beep
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const oscRef = useRef<OscillatorNode | null>(null);
+  const gainRef = useRef<GainNode | null>(null);
+  const beepStartTimerRef = useRef<number | null>(null);
+
 
   // Camera & canvases
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -381,16 +391,57 @@ export default function App() {
 
   // Classifier state
   const [level, setLevel] = useState<DistractionLevel>("Focused");
+  // 🔄 Sync updates to the mini dashboard (focus status + timer)
+  useEffect(() => {
+    const ch = new BroadcastChannel("arfocus-productive");
+    ch.postMessage({
+      type: "focus:update",
+      focused: level === "Focused",
+      timer: `${String(Math.floor(secondsLeft / 60)).padStart(2, "0")}:${String(secondsLeft % 60).padStart(2, "0")}`,
+    });
+    return () => ch.close();
+  }, [level, secondsLeft]);
+  // 🔄 Listen for control messages from the mini dashboard
+  useEffect(() => {
+    const ch = new BroadcastChannel("arfocus-productive");
+
+    ch.onmessage = (ev) => {
+      const msg = ev.data;
+      if (!msg?.type) return;
+
+      if (msg.type === "control:start") startTimer();
+      if (msg.type === "control:pause") pauseTimer();
+      if (msg.type === "control:reset") resetTimer();
+      if (msg.type === "control:save") stopAndSave();
+    };
+
+    return () => ch.close();
+  }, []);
 
   // Eyes/phone/tab timers & beep state
   const eyesClosedMsRef = useRef(0);
   const lastPhoneSeenAtRef = useRef(0);
-  const lastBeepAtRef = useRef(0);
-  const prevEffectiveRef = useRef<boolean | null>(null);
+  // const lastBeepAtRef = useRef(0);
+  // const prevEffectiveRef = useRef<boolean | null>(null);
 
   // Productive tabs heartbeat
   const productiveChannelRef = useRef<BroadcastChannel | null>(null);
   const lastProductivePingRef = useRef<number>(-1);
+  // Allow working in other tabs without penalty
+  const [allowHiddenWork, setAllowHiddenWork] = useState(true);
+  useEffect(() => {
+    const v = localStorage.getItem("arfocus.allowHiddenWork");
+    if (v !== null) setAllowHiddenWork(v === "true");
+  }, []);
+  useEffect(() => {
+    localStorage.setItem("arfocus.allowHiddenWork", String(allowHiddenWork));
+  }, [allowHiddenWork]);
+
+  // Track last time vision pipeline ran (even while hidden)
+  const lastVisionAtRef = useRef<number>(performance.now());
+
+  // Optional companion window that sends productive pings
+  const companionRef = useRef<Window | null>(null);
 
   // ---- Visibility + productive channel
   useEffect(() => {
@@ -472,36 +523,89 @@ export default function App() {
     return () => clearInterval(id);
   }, [isRunning, isOnBreak, workMinutes, breakMinutes, level]);
 
-  // ---- Beep: single-shot on transition to distracted with cooldown
+  // ---- Beep: delayed continuous tone while distracted ----
   useEffect(() => {
-    const a = audioRef.current;
-    if (!a || !beepOnDistract) return;
+    const shouldBeep = beepOnDistract && isRunning && !isOnBreak && level !== "Focused";
 
-    const prevEff = prevEffectiveRef.current;
-    const nowEff = level === "Focused";
-    const transitionedToDistracted = (prevEff === true || prevEff === null) && nowEff === false;
-
-    if (isRunning && !isOnBreak && transitionedToDistracted) {
-      const t = performance.now();
-      if (t - lastBeepAtRef.current > BEEP_COOLDOWN_MS) {
-        try {
-          a.pause();
-          a.currentTime = 0;
-          a.loop = false; // do not loop; single shot
-          a.volume = clamp(beepVolume, 0, 1);
-          a.play().catch(() => {});
-          lastBeepAtRef.current = t;
-        } catch {}
+    if (shouldBeep) {
+      // Start after a small delay to avoid chirps on brief dips
+      if (!oscRef.current && beepStartTimerRef.current == null) {
+        beepStartTimerRef.current = window.setTimeout(() => {
+          beepStartTimerRef.current = null;
+          startContinuousBeep();
+        }, BEEP_START_DELAY_MS) as unknown as number;
       }
+    } else {
+      // back to focus, paused, on break, or toggle off
+      stopContinuousBeep();
     }
+  }, [beepOnDistract, isRunning, isOnBreak, level]);
 
-    prevEffectiveRef.current = nowEff;
-
-    if (level === "Focused" || !isRunning || isOnBreak) {
-      try { if (!a.paused) { a.pause(); a.currentTime = 0; } } catch {}
+  // Keep volume responsive to slider
+  useEffect(() => {
+    if (gainRef.current && audioCtxRef.current) {
+      const ctx = audioCtxRef.current;
+      const vol = clamp(beepVolume, 0, 1) * BEEP_MAX_GAIN;
+      // smooth ramp to avoid clicks
+      gainRef.current.gain.linearRampToValueAtTime(vol, ctx.currentTime + 0.05);
     }
-  }, [beepOnDistract, beepVolume, isRunning, isOnBreak, level]);
+  }, [beepVolume]);
 
+  // Safety: stop tone if component unmounts
+  useEffect(() => () => stopContinuousBeep(), []);
+
+  function startContinuousBeep() {
+    // lazy create AudioContext
+    if (!audioCtxRef.current) {
+      const Ctx: any = (window as any).AudioContext || (window as any).webkitAudioContext;
+      if (!Ctx) return; // no Web Audio available
+      audioCtxRef.current = new Ctx();
+    }
+    const ctx = audioCtxRef.current!;
+    if (ctx.state === "suspended") { try { ctx.resume(); } catch {} }
+  
+    // already running?
+    if (oscRef.current) return;
+  
+    const osc = ctx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.value = BEEP_FREQ_HZ;
+  
+    const gain = ctx.createGain();
+    const vol = clamp(beepVolume, 0, 1) * BEEP_MAX_GAIN;
+    gain.gain.setValueAtTime(vol, ctx.currentTime);
+  
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+  
+    oscRef.current = osc;
+    gainRef.current = gain;
+  }
+  
+  function stopContinuousBeep() {
+    if (beepStartTimerRef.current) {
+      window.clearTimeout(beepStartTimerRef.current);
+      beepStartTimerRef.current = null;
+    }
+    try { oscRef.current?.stop(); } catch {}
+    try { oscRef.current?.disconnect(); } catch {}
+    try { gainRef.current?.disconnect(); } catch {}
+    oscRef.current = null;
+    gainRef.current = null;
+  }
+  function openCompanionPinger() {
+    if (companionRef.current && !companionRef.current.closed) return;
+    const w = window.open("/miniWindow.html", "arfocus_companion", "width=300,height=240,noopener,noreferrer");
+    if (!w) return;
+    companionRef.current = w;
+  }
+  
+  
+  function closeCompanionPinger() {
+    try { companionRef.current?.close(); } catch {}
+    companionRef.current = null;
+  }
+  
   // ---- Start/Pause/Reset/Save
   async function startTimer() {
     if (!isRunning) {
@@ -512,6 +616,7 @@ export default function App() {
         } catch {}
       }
       setIsRunning(true);
+      if (allowHiddenWork) openCompanionPinger();
       if (!sessionStartRef.current) {
         sessionStartRef.current = new Date().toISOString();
         hpStartRef.current = hp;
@@ -520,6 +625,7 @@ export default function App() {
   }
   function pauseTimer() {
     setIsRunning(false);
+    closeCompanionPinger();
   }
   function resetTimer() {
     setIsRunning(false);
@@ -531,6 +637,7 @@ export default function App() {
     sessionStartRef.current = null;
     const a = audioRef.current;
     if (a && !a.paused) { a.pause(); a.currentTime = 0; }
+    closeCompanionPinger();
   }
   async function stopAndSave() {
     setIsRunning(false);
@@ -575,6 +682,7 @@ export default function App() {
   
     const a = audioRef.current;
     if (a && !a.paused) { a.pause(); a.currentTime = 0; }
+    closeCompanionPinger();
   }
   
   
@@ -947,10 +1055,21 @@ export default function App() {
     if (localPitch > 15) timersRef.current.lookDown = Math.min(DOWN_STRONG_MS + 2000, timersRef.current.lookDown + dt);
     else timersRef.current.lookDown = 0;
 
-    // Tab hidden — only counts if NOT a productive tab
-    const freshProductive = (performance.now() - lastProductivePingRef.current) <= PRODUCTIVE_PING_FRESH_MS;
-    if (document.hidden && !freshProductive) timersRef.current.tabInactive = Math.min(5000, timersRef.current.tabInactive + dt);
-    else timersRef.current.tabInactive = 0;
+    // Tab hidden — allow multi-tab work if (a) we still capture frames or (b) companion/pings are fresh
+    const nowMs = performance.now();
+    const freshProductive = (nowMs - lastProductivePingRef.current) <= PRODUCTIVE_PING_FRESH_MS;
+
+    // If camera still delivers frames while hidden, treat as OK
+    const freshCapture = (nowMs - lastVisionAtRef.current) <= Math.max(1000, BG_INTERVAL_MS * 3);
+
+    // Hidden is OK when multi-tab allowed AND we have either a ping or fresh capture
+    const hiddenOk = allowHiddenWork && (freshProductive || freshCapture);
+
+    if (document.hidden && !hiddenOk) {
+      timersRef.current.tabInactive = Math.min(8000, timersRef.current.tabInactive + dt);
+    } else {
+      timersRef.current.tabInactive = 0;
+    }
 
     if (dark) timersRef.current.camDark = Math.min(NO_FACE_STRONG_MS + 2000, timersRef.current.camDark + dt);
     else timersRef.current.camDark = 0;
@@ -961,19 +1080,20 @@ export default function App() {
     // Critical
     if (
       phoneDetected ||
-      (document.hidden && !freshProductive) ||
-      timersRef.current.noFace > 3000 ||      // >3s
-      timersRef.current.camDark > 2000        // >2s covered quickly escalates
+      timersRef.current.tabInactive > 3000 ||
+      timersRef.current.noFace > 3000 ||
+      timersRef.current.camDark > 2000
     ) {
       nextLevel = "Critical";
     } else {
       // Strong
       if (
-        eyesClosedMsRef.current >= EYE_CLOSED_MAX_MS ||              // ≤1s closed/covered
-        timersRef.current.eyesNotVisible > EYES_NOT_VISIBLE_MS ||    // >2s no visible eyes
+        eyesClosedMsRef.current >= EYE_CLOSED_MAX_MS ||
+        timersRef.current.eyesNotVisible > EYES_NOT_VISIBLE_MS ||
         headOver45 ||
         timersRef.current.lookDown > DOWN_STRONG_MS ||
-        phoneDetected
+        phoneDetected ||
+        timersRef.current.tabInactive > 2000
       ) {
         nextLevel = "Strong";
       }
@@ -981,17 +1101,19 @@ export default function App() {
       else if (
         timersRef.current.eyesAway > EYES_AWAY_MIN_MS ||
         head15to45 ||
-        timersRef.current.lookDown > DOWN_MILD_MS
+        timersRef.current.lookDown > DOWN_MILD_MS ||
+        timersRef.current.tabInactive > 1000
       ) {
         nextLevel = "Mild";
       } else {
         // Strict focus
-        if (!(localGazeOn && headWithin15 && !phoneDetected && !(document.hidden && !freshProductive) && !dark && haveFace)) {
+        if (!(localGazeOn && headWithin15 && !phoneDetected && !dark && haveFace)) {
           nextLevel = "Focused";
         }
       }
     }
 
+    lastVisionAtRef.current = performance.now();
     setLevel(nextLevel);
   }
 
@@ -1203,8 +1325,34 @@ export default function App() {
                     cameraOn ? "bg-emerald-600 text-white" : "bg-slate-200 text-slate-900"}`}>
                   {cameraOn ? "On" : "Off"}
                 </button>
-
               </div>
+
+              <div className="flex items-center justify-between">
+              <label className="text-sm">Mirror camera</label>
+                <button
+                  onClick={() => setMirrorCam((v) => !v)}
+                  className={`px-3 py-1 rounded-xl ${
+                    mirrorCam
+                      ? "bg-emerald-600 text-white"
+                      : isDark
+                        ? "bg-slate-800 text-slate-100"
+                        : "bg-slate-200 text-slate-900"}`}>
+                  {mirrorCam ? "On" : "Off"}
+                </button>
+              </div>
+              
+              <div className="flex items-center justify-between">
+                <label className="text-sm">Multi-tab mode (don’t penalize hidden tabs)</label>
+                <button
+                  onClick={() => setAllowHiddenWork(v => !v)}
+                  className={`px-3 py-1 rounded-xl ${
+                    allowHiddenWork ? "bg-emerald-600 text-white" : "bg-slate-200 text-slate-900"
+                  }`}
+                >
+                  {allowHiddenWork ? "On" : "Off"}
+                </button>
+              </div>
+
 
               <div className={`text-xs ${Subtle} leading-relaxed`}>
                 • All processing is local in your browser. • No video is recorded or uploaded.
@@ -1266,14 +1414,18 @@ export default function App() {
               ref={videoRef}
               playsInline
               muted
-              className={`w-full h-full object-cover opacity-70 ${cameraOn ? "" : "hidden"}`}
+              className={`w-full h-full object-cover opacity-70 ${cameraOn ? "" : "hidden"} ${
+                mirrorCam ? "-scale-x-100" : ""
+              }`}
             />
 
             <canvas
               ref={canvasRef}
-              // canvas tracks the same box; overlay exactly
-              className="absolute inset-0 w-full h-full pointer-events-none"
+              className={`absolute inset-0 w-full h-full pointer-events-none ${
+                mirrorCam ? "-scale-x-100" : ""
+              }`}
             />
+
             {(!modelReady || !objectModelReady) && (
               <div className="absolute inset-0 flex items-center justify-center text-white/80 text-sm">
                 Initializing models…

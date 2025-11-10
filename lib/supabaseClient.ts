@@ -1,7 +1,6 @@
 // Minimal Supabase client (single place that imports the npm package).
 // Make sure you run:  npm i @supabase/supabase-js
 // And set .env values: VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY
-/// <reference types="vite/client" />
 
 import { createClient } from "@supabase/supabase-js";
 
